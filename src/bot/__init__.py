@@ -48,7 +48,7 @@ API_RPS = float(os.getenv("API_RPS", "2.5"))
 API_BURST = int(os.getenv("API_BURST", "8"))
 RESPECT_RETRY_AFTER = (os.getenv("RESPECT_RETRY_AFTER", "1").strip() != "0")
 
-NOTE_TEXT = "use !help [Version 2.6.1]"
+NOTE_TEXT = "use /help [version 0.1.6]"
 # --- Keep-warm (Render Free) ---
 KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()  # e.g., https://your-app.onrender.com/healthz?t=YOUR_TOKEN
 KEEPALIVE_INTERVAL_S = int(os.getenv("KEEPALIVE_INTERVAL_S", "240"))  # ping every 4 minutes
