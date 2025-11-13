@@ -1,87 +1,91 @@
-import os, re, random, asyncio, logging, time
+import os
+import re
+import random
+import asyncio
+import logging
+import time
 from typing import Optional, Tuple, Dict, Any, List
 from urllib.parse import urlparse, parse_qs
 from decimal import Decimal, ROUND_HALF_UP
 from contextlib import asynccontextmanager
 
-
+import aiohttp
 import discord
 from discord.ext import commands
 from discord import app_commands
-import aiohttp
 
 from .allowed_channels import (
-    init_allowed, allowed_channel_check, slash_allowed_check,
-    check_failure_reply, register_allowed_admin_commands
+    init_allowed,
+    allowed_channel_check,
+    slash_allowed_check,
+    check_failure_reply,
+    register_allowed_admin_commands,
 )
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("rbx-gp-bot")
 
-# Try Playwright (guarded)
-TRY_PLAYWRIGHT = False
-try:
-    from playwright.async_api import async_playwright  # type: ignore
-    TRY_PLAYWRIGHT = True
-except Exception:
-    TRY_PLAYWRIGHT = False
-
 # ---------------- Config ----------------
 COMMAND_PREFIX = "!"
-HEADLESS = True
-RENDER_TIMEOUT_MS = 12_000
 USER_COOLDOWN_SECONDS = 1.5
 
-FAST_MODE = (os.getenv("FAST_MODE", "1").strip() != "0")
-AUTO_SCRAPE_ON_FAIL = (os.getenv("AUTO_SCRAPE_ON_FAIL", "1").strip() != "0")
-FORCE_SCRAPE = (os.getenv("FORCE_SCRAPE", "0").strip() == "1")
-SPEED_MODE = os.getenv("SPEED_MODE", "fast").strip().lower()  # "fast" | "turbo"
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
-
-FORCE_RP_VIA_COMPARE = (os.getenv("FORCE_RP_VIA_COMPARE", "1").strip() != "0")
-
-THROTTLE_THRESHOLD = int(os.getenv("THROTTLE_THRESHOLD", "11"))
-FAST_CONCURRENCY   = int(os.getenv("FAST_CONCURRENCY", "6"))
-SLOW_CONCURRENCY   = int(os.getenv("SLOW_CONCURRENCY", "3"))
-SLOW_JITTER_MAX    = float(os.getenv("SLOW_JITTER_MAX", "0.35"))
-SLOW_BATCH_SLEEP_S = float(os.getenv("SLOW_BATCH_SLEEP_S", "0.8"))
 
 API_RPS = float(os.getenv("API_RPS", "3"))
 API_BURST = int(os.getenv("API_BURST", "6"))
-RESPECT_RETRY_AFTER = (os.getenv("RESPECT_RETRY_AFTER", "1").strip() != "0")
+RESPECT_RETRY_AFTER = os.getenv("RESPECT_RETRY_AFTER", "1").strip() != "0"
 
-NOTE_TEXT = "use !help [Version 0.1.1]"
-# --- Keep-warm (Render Free) ---
-KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()  # e.g., https://your-app.onrender.com/healthz?t=YOUR_TOKEN
-KEEPALIVE_INTERVAL_S = int(os.getenv("KEEPALIVE_INTERVAL_S", "240"))  # ping every 4 minutes
+NOTE_TEXT = "use !help [Version 0.1.3]"
 
-# ---- Owner-only guard (/diag) ----
+# Keep-warm (optional)
+KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()
+KEEPALIVE_INTERVAL_S = int(os.getenv("KEEPALIVE_INTERVAL_S", "240"))
+
+# Owner-only guard (/diag)
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+
+
 def _owner_only(interaction: discord.Interaction) -> bool:
     return OWNER_ID != 0 and interaction.user.id == OWNER_ID
+
 
 PRICE_PATTERNS = [
     r"\b(\d[\d,\.]*)\s*robux\b",
     r"\brobux\s*(\d[\d,\.]*)\b",
 ]
 
+# Tokens / cookies
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 ROBLOSECURITY_MAIN = (os.getenv("ROBLOSECURITY", "") or "").replace("\r", "").replace("\n", "")
 ROBLOSECURITY_COOKIES = {
     "A": (os.getenv("ROBLOSECURITY_A", "") or "").replace("\r", "").replace("\n", ""),
     "B": (os.getenv("ROBLOSECURITY_B", "") or "").replace("\r", "").replace("\n", ""),
 }
+
 if not DISCORD_TOKEN:
     raise SystemExit("DISCORD_TOKEN not set in .env")
+
 if not ROBLOSECURITY_MAIN:
     log.warning("ROBLOSECURITY not set — API-only mode. Some prices might fail.")
+
 if not any(ROBLOSECURITY_COOKIES.values()):
     log.warning("ROBLOSECURITY_A / B not set — fewer backup cookies available.")
+
 
 # ---------------- Bot setup ----------------
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+
+bot = commands.Bot(
+    command_prefix=COMMAND_PREFIX,
+    intents=intents,
+    help_command=None,
+    status=discord.Status.online,
+    activity=discord.Activity(
+        type=discord.ActivityType.watching,
+        name="Blink ;)",
+    ),
+)
 
 _last_used_by_user: Dict[int, float] = {}
 
@@ -91,24 +95,30 @@ register_allowed_admin_commands(bot)
 
 # ---------- aiohttp ----------
 _http_session: Optional[aiohttp.ClientSession] = None
+
+
 @asynccontextmanager
 async def http_session():
     global _http_session
-    
+
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
-            headers={"User-Agent": "rbx-gp-bot/2.6.1 (+discord)"}
+            headers={"User-Agent": "rbx-gp-bot/2.6.1 (+discord)"},
         )
     try:
         yield _http_session
     finally:
+        # kept open for reuse
         pass
+
 
 # ---------- rate limit ----------
 _api_tokens = API_BURST
 _api_last = time.monotonic()
 _api_lock = asyncio.Lock()
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
 
 async def _api_rate_gate():
     """
@@ -127,7 +137,6 @@ async def _api_rate_gate():
             _api_tokens = 0
         _api_tokens -= 1
 
-RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 async def _http_get_json(url: str, *, cookies: Optional[Dict[str, str]] = None) -> Any:
     """
@@ -147,7 +156,11 @@ async def _http_get_json(url: str, *, cookies: Optional[Dict[str, str]] = None) 
                             if retry_after:
                                 try:
                                     delay = float(retry_after)
-                                    log.warning("429 with Retry-After=%s → sleeping %s", retry_after, delay)
+                                    log.warning(
+                                        "429 with Retry-After=%s → sleeping %s",
+                                        retry_after,
+                                        delay,
+                                    )
                                     await asyncio.sleep(delay)
                                     continue
                                 except Exception:
@@ -170,8 +183,11 @@ async def _http_get_json(url: str, *, cookies: Optional[Dict[str, str]] = None) 
                     continue
                 raise
 
+
 # ---------- cache ----------
 _cache: Dict[str, Tuple[float, Any]] = {}
+
+
 def _getc(key: str) -> Optional[Any]:
     ent = _cache.get(key)
     if not ent:
@@ -182,14 +198,17 @@ def _getc(key: str) -> Optional[Any]:
         return None
     return val
 
+
 def _setc(key: str, val: Any):
     _cache[key] = (time.time(), val)
+
 
 def _clear_gp_cache():
     keys = [k for k in _cache.keys() if k.startswith("gp:")]
     for k in keys:
         _cache.pop(k, None)
     log.info("Cleared %d cache entries for gamepasses.", len(keys))
+
 
 # ---------- Roblox API helpers ----------
 async def api_get_details(gamepass_id: int) -> Optional[Dict[str, Any]]:
@@ -205,6 +224,7 @@ async def api_get_details(gamepass_id: int) -> Optional[Dict[str, Any]]:
     _setc(ck, data)
     return data
 
+
 def robux_received_after_fee(price: int) -> int:
     """
     Roblox takes 30% marketplace fee. Round to nearest integer.
@@ -213,7 +233,10 @@ def robux_received_after_fee(price: int) -> int:
     net = gross * Decimal("0.7")
     return int(net.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
-async def get_price_via_api(gamepass_id: int) -> Tuple[Optional[int], Dict[str, Any]]:
+
+async def get_price_via_api(
+    gamepass_id: int,
+) -> Tuple[Optional[int], Dict[str, Any]]:
     """
     Try to get price via Roblox API.
     Returns (price, details).
@@ -231,6 +254,7 @@ async def get_price_via_api(gamepass_id: int) -> Tuple[Optional[int], Dict[str, 
     except Exception:
         price_int = None
     return price_int, details
+
 
 async def try_cookie(gamepass_id: int, cookie_key: str) -> Optional[int]:
     """
@@ -250,9 +274,12 @@ async def try_cookie(gamepass_id: int, cookie_key: str) -> Optional[int]:
     except Exception:
         return None
 
-async def get_price_any(gamepass_id: int) -> Tuple[Optional[int], Dict[str, Any], bool]:
+
+async def get_price_any(
+    gamepass_id: int,
+) -> Tuple[Optional[int], Dict[str, Any], bool]:
     """
-    Try main cookie, then backup cookies, then fall back to scraping (if enabled).
+    Try main cookie, then backup cookies.
     Returns (price, details, used_fallback).
     """
     details = await api_get_details(gamepass_id)
@@ -277,8 +304,8 @@ async def get_price_any(gamepass_id: int) -> Tuple[Optional[int], Dict[str, Any]
             pi["price"] = p
             return p, details, used_fallback
 
-    # scraping could be added here if you want, but for now it's disabled / omitted
     return None, details or {}, used_fallback
+
 
 def _rp_flag_from_details(details: Dict[str, Any]) -> bool:
     """
@@ -287,9 +314,12 @@ def _rp_flag_from_details(details: Dict[str, Any]) -> bool:
     pi = details.get("priceInformation") or {}
     enabled = [str(x).lower() for x in (pi.get("enabledFeatures") or [])]
     in_exp = bool(pi.get("isInActivePriceOptimizationExperiment"))
-    if in_exp: return True
-    if any(("regional" in x) or ("price" in x) for x in enabled): return True
+    if in_exp:
+        return True
+    if any(("regional" in x) or ("price" in x) for x in enabled):
+        return True
     return False
+
 
 async def get_owner_name(universe_id: int) -> Optional[str]:
     """
@@ -301,6 +331,7 @@ async def get_owner_name(universe_id: int) -> Optional[str]:
         return None
     owner = (data[0] or {}).get("creator", {}) or {}
     return owner.get("name") or None
+
 
 # ---------- parsing ----------
 def extract_gamepass_id(text: str) -> Optional[int]:
@@ -335,6 +366,7 @@ def extract_gamepass_id(text: str) -> Optional[int]:
 
     return None
 
+
 def extract_many_ids(text: str, max_ids: int = 25) -> List[int]:
     """
     Extract multiple possible gamepass IDs from text.
@@ -353,6 +385,7 @@ def extract_many_ids(text: str, max_ids: int = 25) -> List[int]:
             break
     return ids
 
+
 def parse_first_price(text: str) -> Optional[int]:
     """
     Look for a '123 robux' style pattern in text & return the first match.
@@ -368,8 +401,14 @@ def parse_first_price(text: str) -> Optional[int]:
                 continue
     return None
 
+
 # ---------- embeds ----------
-def build_min_card(gamepass_id: int, price: Optional[int], details: Dict[str, Any], used_fallback: bool) -> discord.Embed:
+def build_min_card(
+    gamepass_id: int,
+    price: Optional[int],
+    details: Dict[str, Any],
+    used_fallback: bool,
+) -> discord.Embed:
     """
     Build a minimal embed for a single gamepass.
     """
@@ -401,7 +440,12 @@ def build_min_card(gamepass_id: int, price: Optional[int], details: Dict[str, An
     )
     embed.add_field(name="Info", value=price_line, inline=False)
 
-    universe_id = (details.get("universeId") or details.get("universeID") or 0)
+    universe_id = (
+        details.get("universeId")
+        or details.get("universeID")
+        or (details.get("universe", {}) or {}).get("id")
+        or 0
+    )
     if universe_id:
         embed.set_footer(text=f"Universe ID: {universe_id}")
     else:
@@ -409,14 +453,20 @@ def build_min_card(gamepass_id: int, price: Optional[int], details: Dict[str, An
 
     return embed
 
+
 def build_summary_card(count: int, with_price: int, offsale: int) -> discord.Embed:
     embed = discord.Embed(
         title="Scan summary",
-        description=f"Scanned {count} gamepasses.\nPriced: {with_price}\nOffsale / unknown: {offsale}",
+        description=(
+            f"Scanned {count} gamepasses.\n"
+            f"Priced: {with_price}\n"
+            f"Offsale / unknown: {offsale}"
+        ),
         color=discord.Color.dark_gray(),
     )
     embed.set_footer(text=NOTE_TEXT)
     return embed
+
 
 # ---------- user throttle ----------
 def rate_limit(user_id: int) -> bool:
@@ -427,50 +477,49 @@ def rate_limit(user_id: int) -> bool:
     _last_used_by_user[user_id] = now
     return True
 
+
 # ---------- background keep-warm ----------
 async def _keep_service_warm():
     """
-    Periodically ping the external health URL so the Render Free dyno stays warm.
+    Periodically ping the external health URL so the Free dyno stays warm.
     Uses the shared aiohttp session and swallows errors (never crashes the bot).
     """
     if not KEEPALIVE_URL:
         return
-    log.info("Keep-warm enabled → pinging %s every %s seconds", KEEPALIVE_URL, KEEPALIVE_INTERVAL_S)
+    log.info(
+        "Keep-warm enabled → pinging %s every %s seconds",
+        KEEPALIVE_URL,
+        KEEPALIVE_INTERVAL_S,
+    )
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
             async with http_session() as session:
                 async with session.get(KEEPALIVE_URL) as resp:
-                    log.info("Keep-warm ping → %s %s", resp.status, await resp.text())
+                    txt = await resp.text()
+                    log.info("Keep-warm ping → %s %s", resp.status, txt[:100])
         except Exception as e:
             log.warning("Keep-warm ping failed: %s", e)
         await asyncio.sleep(KEEPALIVE_INTERVAL_S)
 
+
 # ---------- core scan logic ----------
-async def _scan_data(gamepass_id: int) -> Tuple[int, Optional[int], Dict[str, Any], bool]:
+async def _scan_data(
+    gamepass_id: int,
+) -> Tuple[int, Optional[int], Dict[str, Any], bool]:
     price, details, used_fallback = await get_price_any(gamepass_id)
     return gamepass_id, price, details, used_fallback
 
+
 async def build_embeds_for_ids(ids: List[int]) -> List[discord.Embed]:
-    if SPEED_MODE == "fast":
-        sem = asyncio.Semaphore(FAST_CONCURRENCY)
-        async def one(i: int):
-            async with sem:
-                return await _scan_data(i)
-        tasks = [one(i) for i in ids]
-        results = await asyncio.gather(*tasks)
-    else:
-        sem = asyncio.Semaphore(SLOW_CONCURRENCY)
-        async def one(i: int):
-            async with sem:
-                await asyncio.sleep(random.random() * SLOW_JITTER_MAX)
-                return await _scan_data(i)
-        tasks = [one(i) for i in ids]
-        results = []
-        for i, t in enumerate(tasks):
-            results.append(await t)
-            if (i + 1) % SLOW_CONCURRENCY == 0:
-                await asyncio.sleep(SLOW_BATCH_SLEEP_S)
+    sem = asyncio.Semaphore(5)
+
+    async def one(i: int):
+        async with sem:
+            return await _scan_data(i)
+
+    tasks = [one(i) for i in ids]
+    results = await asyncio.gather(*tasks)
 
     embeds: List[discord.Embed] = []
     with_price = 0
@@ -486,6 +535,7 @@ async def build_embeds_for_ids(ids: List[int]) -> List[discord.Embed]:
         embeds.append(build_summary_card(len(ids), with_price, offsale))
     return embeds
 
+
 async def _send(ctx_or_interaction, embeds: List[discord.Embed]):
     """
     Unified send for both prefix + slash.
@@ -496,21 +546,30 @@ async def _send(ctx_or_interaction, embeds: List[discord.Embed]):
             await ctx_or_interaction.reply(embed=emb, mention_author=False)
     else:
         # slash
-        if len(embeds) == 1:
-            await ctx_or_interaction.response.send_message(embed=embeds[0])
+        if not embeds:
+            return
+        if not ctx_or_interaction.response.is_done():
+            if len(embeds) == 1:
+                await ctx_or_interaction.response.send_message(embed=embeds[0])
+            else:
+                await ctx_or_interaction.response.send_message(embeds=[embeds[0]])
+                for emb in embeds[1:]:
+                    await ctx_or_interaction.followup.send(embed=emb)
         else:
-            await ctx_or_interaction.response.send_message(embeds=[embeds[0]])
-            for emb in embeds[1:]:
+            for emb in embeds:
                 await ctx_or_interaction.followup.send(embed=emb)
 
-async def _send_embeds_in_chunks(ctx_or_interaction, embeds: List[discord.Embed], chunk_size: int = 5):
+
+async def _send_embeds_in_chunks(
+    ctx_or_interaction, embeds: List[discord.Embed], chunk_size: int = 5
+):
     """
     For scan_multi: send embeds in chunks to avoid hitting limits.
     """
     if isinstance(ctx_or_interaction, commands.Context):
         # prefix
         for i in range(0, len(embeds), chunk_size):
-            chunk = embeds[i:i+chunk_size]
+            chunk = embeds[i : i + chunk_size]
             await ctx_or_interaction.reply(embeds=chunk, mention_author=False)
     else:
         # slash
@@ -518,26 +577,38 @@ async def _send_embeds_in_chunks(ctx_or_interaction, embeds: List[discord.Embed]
             return
         first = embeds[0]
         rest = embeds[1:]
-        await ctx_or_interaction.response.send_message(embed=first)
+        if not ctx_or_interaction.response.is_done():
+            await ctx_or_interaction.response.send_message(embed=first)
+        else:
+            await ctx_or_interaction.followup.send(embed=first)
+
         for i in range(0, len(rest), chunk_size):
-            chunk = rest[i:i+chunk_size]
+            chunk = rest[i : i + chunk_size]
             await ctx_or_interaction.followup.send(embeds=chunk)
+
 
 # ---------- events ----------
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    # Start keep-warm task (optional)
     try:
         bot.loop.create_task(_keep_service_warm())
     except Exception as e:
         log.warning("Failed to start keep-warm task: %s", e)
+
     try:
         await bot.tree.sync()
         log.info("Synced application commands.")
     except Exception as e:
         log.warning("Failed to sync app commands: %s", e)
 
+
 # ---------- commands ----------
+
+# PING
+
 @bot.command(name="ping", help="Check if the bot is alive.")
 @allowed_channel_check
 async def ping_prefix(ctx: commands.Context):
@@ -545,30 +616,26 @@ async def ping_prefix(ctx: commands.Context):
         return
     await ctx.reply("Pong!", mention_author=False)
 
-@bot.hybrid_command(name="help", with_app_command=True, help="Show help for commands.")
-@allowed_channel_check
-async def help_prefix(ctx: commands.Context):
-    text = (
-        "**Commands:**\n"
-        f"- `{COMMAND_PREFIX}ping` — basic ping.\n"
-        f"- `{COMMAND_PREFIX}scan <id or url>` — scan a single gamepass.\n"
-        f"- `{COMMAND_PREFIX}scan_multi <ids or urls>` — scan multiple gamepasses.\n"
-        "\n"
-        "You can also use slash commands: `/ping`, `/scan`, `/scan_multi`.\n\n"
-        f"Note: {NOTE_TEXT}"
-    )
-    await ctx.reply(text, mention_author=False)
 
 @bot.tree.command(name="ping", description="Check if the bot is alive.")
 @slash_allowed_check
 async def ping_slash(interaction: discord.Interaction):
     if not rate_limit(interaction.user.id):
-        return await interaction.response.send_message("Slow down a bit.", ephemeral=True)
+        return await interaction.response.send_message(
+            "Slow down a bit.", ephemeral=True
+        )
     await interaction.response.send_message("Pong!", ephemeral=True)
 
-@bot.tree.command(name="help", description="Show help for commands.")
-@slash_allowed_check
-async def help_slash(interaction: discord.Interaction):
+
+# HELP (hybrid: !help + /help)
+
+@bot.hybrid_command(
+    name="help",
+    with_app_command=True,
+    help="Show help for commands.",
+)
+@allowed_channel_check
+async def help_cmd(ctx: commands.Context):
     text = (
         "**Commands:**\n"
         f"- `{COMMAND_PREFIX}ping` — basic ping.\n"
@@ -578,7 +645,10 @@ async def help_slash(interaction: discord.Interaction):
         "You can also use these as slash commands.\n\n"
         f"Note: {NOTE_TEXT}"
     )
-    await interaction.response.send_message(text, ephemeral=True)
+    await ctx.reply(text, mention_author=False)
+
+
+# SCAN (single)
 
 @bot.command(name="scan", help="Scan a single gamepass by ID or URL.")
 @allowed_channel_check
@@ -587,42 +657,73 @@ async def scan_prefix(ctx: commands.Context, *, arg: str):
         return
     gp_id = extract_gamepass_id(arg)
     if not gp_id:
-        return await ctx.reply("Could not find a valid gamepass ID in your input.", mention_author=False)
+        return await ctx.reply(
+            "Could not find a valid gamepass ID in your input.",
+            mention_author=False,
+        )
     embeds = await build_embeds_for_ids([gp_id])
     await _send(ctx, embeds)
+
 
 @bot.tree.command(name="scan", description="Scan a single gamepass by ID or URL.")
 @slash_allowed_check
 async def scan_slash(interaction: discord.Interaction, arg: str):
     if not rate_limit(interaction.user.id):
-        return await interaction.response.send_message("Slow down a bit.", ephemeral=True)
+        return await interaction.response.send_message(
+            "Slow down a bit.", ephemeral=True
+        )
     gp_id = extract_gamepass_id(arg)
     if not gp_id:
-        return await interaction.response.send_message("Could not find a valid gamepass ID in your input.", ephemeral=True)
+        return await interaction.response.send_message(
+            "Could not find a valid gamepass ID in your input.",
+            ephemeral=True,
+        )
     embeds = await build_embeds_for_ids([gp_id])
     await _send(interaction, embeds)
 
-@bot.command(name="scan_multi", help="Scan multiple gamepasses (IDs or URLs).")
+
+# SCAN_MULTI
+
+@bot.command(
+    name="scan_multi",
+    help="Scan multiple gamepasses (IDs or URLs) in one go.",
+)
 @allowed_channel_check
 async def scan_multi_prefix(ctx: commands.Context, *, arg: str):
     if not rate_limit(ctx.author.id):
         return
     ids = extract_many_ids(arg)
     if not ids:
-        return await ctx.reply("Could not find any valid gamepass IDs in your input.", mention_author=False)
+        return await ctx.reply(
+            "Could not find any valid gamepass IDs in your input.",
+            mention_author=False,
+        )
     embeds = await build_embeds_for_ids(ids)
     await _send_embeds_in_chunks(ctx, embeds)
 
-@bot.tree.command(name="scan_multi", description="Scan multiple gamepasses (IDs or URLs).")
+
+@bot.tree.command(
+    name="scan_multi",
+    description="Scan multiple gamepasses (IDs or URLs).",
+)
 @slash_allowed_check
 async def scan_multi_slash(interaction: discord.Interaction, arg: str):
     if not rate_limit(interaction.user.id):
-        return await interaction.response.send_message("Slow down a bit.", ephemeral=True)
+        return await interaction.response.send_message(
+            "Slow down a bit.", ephemeral=True
+        )
     ids = extract_many_ids(arg)
     if not ids:
-        return await interaction.response.send_message("Could not find any valid gamepass IDs in your input.", ephemeral=True)
-    embeds = await build_embeds_for_ids(ids)
+        return await interaction.response.send_message(
+            "Could not find any valid gamepass IDs in your input.",
+            ephemeral=True,
+        )
+    embeds = await build_embeds_in_chunks(ids) if False else await build_embeds_for_ids(ids)  # noqa: E501
+    # (line above just to avoid confusion; effectively build_embeds_for_ids)
     await _send_embeds_in_chunks(interaction, embeds)
+
+
+# DIAG
 
 @bot.tree.command(name="diag", description="(Owner only) Diagnostic info.")
 @app_commands.check(_owner_only)
@@ -630,31 +731,34 @@ async def diag_slash(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"Cache size: {len(_cache)} entries\n"
         f"API burst: {API_BURST}, RPS: {API_RPS}\n"
-        f"Fast mode: {FAST_MODE}, Speed mode: {SPEED_MODE}\n"
-        f"Force RP via compare: {FORCE_RP_VIA_COMPARE}\n"
-        f"Auto scrape on fail: {AUTO_SCRAPE_ON_FAIL}\n"
-        f"Force scrape: {FORCE_SCRAPE}\n"
         f"Cache TTL: {CACHE_TTL_SECONDS}s\n"
         f"Keepalive URL set: {bool(KEEPALIVE_URL)}",
         ephemeral=True,
     )
 
+
 @diag_slash.error
-async def _diag_slash_err(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if await check_failure_reply(interaction, error): return
+async def _diag_slash_err(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    if await check_failure_reply(interaction, error):
+        return
     raise error
 
-@help_slash.error
-async def _help_slash_err(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if await check_failure_reply(interaction, error): return
-    raise error
 
 @scan_slash.error
-async def _scan_slash_err(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if await check_failure_reply(interaction, error): return
+async def _scan_slash_err(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    if await check_failure_reply(interaction, error):
+        return
     raise error
 
+
 @scan_multi_slash.error
-async def _scan_multi_slash_err(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if await check_failure_reply(interaction, error): return
+async def _scan_multi_slash_err(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    if await check_failure_reply(interaction, error):
+        return
     raise error

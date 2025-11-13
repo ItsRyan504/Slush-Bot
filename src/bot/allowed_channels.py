@@ -11,8 +11,8 @@
 #   - /setup: create & pin a config message in the current channel
 #   - /reload-config: reload allowed-channel config from pinned message
 #   - On startup, the module automatically scans pinned config messages
-#     across guilds (once) and restores the allowlist, so you don't have
-#     to /allow_here again after each restart.
+#     across guilds and restores the allowlist, so you don't have to
+#     /allow_here again after each restart.
 
 import os
 import json
@@ -125,7 +125,8 @@ def allowed_channel_check(func):
             return True
         try:
             await ctx.reply(
-                "❌ This command isn't allowed in this channel. Ask an admin to use `/setup` or `/allow_here`.",
+                "❌ This command isn't allowed in this channel. "
+                "Ask an admin to use `/setup` or `/allow_here`.",
                 mention_author=False,
             )
         except Exception:
@@ -214,7 +215,7 @@ def _extract_config_json_from_message(msg: discord.Message) -> Optional[dict]:
     end = text.find("```", start + 3)
     if end == -1:
         return None
-    block = text[start + 3 : end]  # may start with 'json\n'
+    block = text[start + 3: end]  # may start with 'json\n'
     if block.startswith("json"):
         block = block[4:]  # drop 'json' + newline
     try:
@@ -395,7 +396,8 @@ def register_allowed_admin_commands(bot: commands.Bot) -> None:
             pins = await channel.pins()
         except (discord.Forbidden, discord.HTTPException):
             return await interaction.response.send_message(
-                "I couldn't read pinned messages here. Do I have `Read Message History` and `Manage Messages`?",
+                "I couldn't read pinned messages here. Do I have "
+                "`Read Message History` and maybe `Manage Messages`?",
                 ephemeral=True,
             )
 
