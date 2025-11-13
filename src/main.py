@@ -5,8 +5,8 @@ from dotenv import load_dotenv
 # Load .env before anything else
 load_dotenv()
 
-from keep_alive import keep_alive
-from bot import bot, DISCORD_TOKEN
+from .keep_alive import keep_alive
+from .bot import bot, DISCORD_TOKEN
 
 
 def main():
